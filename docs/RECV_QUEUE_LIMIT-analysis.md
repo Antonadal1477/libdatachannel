@@ -97,37 +97,86 @@ sequenceDiagram
     Datachannel->>Datachannel: mRecvQueue.push(message)
 ```
 
-### 3.3 拥塞的根源
+### 3.3 拥塞的根源：代码级联锁效应分析
 
-问题的关键在于 `mRecvQueue.push()` 操作的行为。通过分析 `src/impl/queue.hpp` 的代码，我们可以发现这是一个**阻塞队列**。
+拥塞的根本原因在于**应用层的反压（Backpressure）**，它从 `DataChannel` 的接收队列开始，逐层向上传递，最终影响到底层的 `usrsctp` 传输协议。以下是结合代码的详细流程分解：
+
+**第 1 步：`DataChannel` 接收队列达到上限并阻塞**
+
+当网络数据持续到达，而上层应用未能及时消费时，消息在 `DataChannel` 的 `mRecvQueue` 中积压。当队列大小达到 `RECV_QUEUE_LIMIT` 时，`mRecvQueue.push()` 方法内部的 `mPushCondition.wait()` 会阻塞当前线程。
 
 ```cpp
-// src/impl/queue.hpp
+// 调用点: src/impl/datachannel.cpp
+void DataChannel::incoming(message_ptr message) {
+    // ...
+    mRecvQueue.push(message); // 当队列满时，此行代码会阻塞
+    // ...
+}
 
+// 阻塞实现: src/impl/queue.hpp
 template <typename T> void Queue<T>::push(T element) {
 	std::unique_lock lock(mMutex);
+    // 当 mQueue.size() >= mLimit 时，线程在此处等待
 	mPushCondition.wait(lock, [this]() { return mLimit == 0 || mQueue.size() < mLimit || mStopping; });
-	if (mStopping)
-		return;
-
-	mAmount += mAmountFunction(element);
-	mQueue.emplace(std::move(element));
+	// ...
 }
 ```
 
-代码中的 `mPushCondition.wait(...)` 表明，如果队列已满（即 `mQueue.size() >= mLimit`，其中 `mLimit` 就是 `RECV_QUEUE_LIMIT`），那么调用 `push` 的线程将会被**阻塞**，直到队列中有空间可用。
+**第 2 步：`DataChannel::incoming` 阻塞导致 `SctpTransport` 回调停滞**
 
-结合数据接收流程，我们可以推导出拥塞的完整链条：
+`DataChannel::incoming` 方法是由 `SctpTransport` 通过一个 `recv` 回调函数调用的。这个回调函数本身是在 `SctpTransport::processData` 方法中被执行的。
 
-1.  **网络波动**：当网络出现偶发性丢包或抖动时，SCTP 需要进行重传，这可能导致数据到达的速率不均匀，出现瞬时的数据突发。
-2.  **应用层消费不及时**：上层应用可能因为各种原因（例如主线程繁忙、数据处理耗时等）未能及时地从 `mRecvQueue` 中消费数据。
-3.  **`mRecvQueue` 积压**：瞬时的数据突发和应用层消费不及时，共同导致消息在 `mRecvQueue` 中迅速积压。
-4.  **队列达到上限**：当队列中的消息数量达到 `RECV_QUEUE_LIMIT`（例如 1024）时，队列变满。
-5.  **`push` 操作阻塞**：`DataChannel::incoming` 在调用 `mRecvQueue.push()` 时被阻塞。
-6.  **`SctpTransport` 阻塞**：由于 `DataChannel::incoming` 是在 `SctpTransport` 的 `mProcessor` 线程中被调用的，这导致了 `doRecv` 任务的执行被阻塞。
-7.  **`usrsctp` 接收缓冲区填满**：`SctpTransport` 无法再从 `usrsctp` 的 socket 缓冲区中读取数据，导致该缓冲区被迅速填满。
-8.  **触发 `usrsctp` 拥塞控制**：当 `usrsctp` 的接收缓冲区满了之后，它会通过 SCTP 协议通知发送方，将其拥塞窗口（cwnd）和接收窗口（rwnd）大幅减小。
-9.  **速度下降且难以恢复**：发送方收到窗口减小的通知后，会立即限制其发送速率。在网络依然不稳定的情况下，SCTP 的慢启动和拥塞避免算法很难让速度有效恢复，导致了我们观察到的“速度下降且很难恢复”的现象。
+```cpp
+// src/impl/sctptransport.cpp
+void SctpTransport::processData(binary &&data, uint16_t sid, PayloadId ppid) {
+    // ...
+    // recv() 最终会调用到 DataChannel::incoming()
+    recv(make_message(std::move(data), Message::String, sid)); // 如果 DataChannel::incoming 阻塞，则此行代码也会阻塞
+    // ...
+}
+```
+
+因此，当 `DataChannel::incoming` 阻塞时，执行 `SctpTransport::processData` 的线程也被阻塞了。
+
+**第 3 步：`SctpTransport::processData` 阻塞导致 `doRecv` 循环中断**
+
+`processData` 方法是在 `SctpTransport::doRecv` 方法的 `while` 循环中被调用的。`doRecv` 负责从 `usrsctp` 的 socket 中不断地读取数据。
+
+```cpp
+// src/impl/sctptransport.cpp
+void SctpTransport::doRecv() {
+    // ...
+    try {
+        // 这个循环负责持续从 usrsctp 接收数据
+        while (state() != State::Disconnected && state() != State::Failed) {
+            // ...
+            ssize_t len = usrsctp_recvv(mSock, ...); // 从 usrsctp 读取数据
+            // ...
+            if (flags & MSG_EOR) {
+                // ...
+                // 如果 processData 阻塞，整个 while 循环将停滞在此处，无法继续调用 usrsctp_recvv
+                processData(std::move(message), info.rcv_sid, PayloadId(ntohl(info.rcv_ppid)));
+            }
+        }
+    } catch (const std::exception &e) {
+        // ...
+    }
+}
+```
+
+当 `processData` 被阻塞后，`doRecv` 的 `while` 循环就无法继续下一次迭代。这意味着 `SctpTransport` 停止了对 `usrsctp_recvv` 的调用，即**停止了从 `usrsctp` 的接收缓冲区中读取数据**。
+
+**第 4 步：`usrsctp` 接收缓冲区溢出，触发拥塞控制**
+
+`SctpTransport` 停止读取数据，但网络数据仍在通过底层 `DTLSTransport` 到达并被送入 `usrsctp` 的 socket 缓冲区。由于上层无人读取，这个缓冲区会迅速被填满。
+
+对于 SCTP 协议而言，当其接收缓冲区满了之后，它会向发送方报告一个接收窗口（rwnd）大小为 0。这是一个标准的流量控制机制，它告诉发送方：“我已无法再接收任何数据，请停止发送”。
+
+发送方的 SCTP 协议栈收到这个零窗口通告后，会立即停止发送数据。同时，这种接收端无法处理数据的情况会被 `usrsctp` 的拥塞控制算法（例如，类似于 TCP 的 CUBIC 或 Reno）视为网络拥塞的强烈信号。因此，它不仅会停止发送，还会大幅减小其拥塞窗口（cwnd），进入拥塞避免或慢启动阶段。
+
+**结论：**
+
+这个级联效应清晰地表明，一个在应用层 `DataChannel` 中设置得过小的 `RECV_QUEUE_LIMIT`，如何通过一系列的阻塞调用，最终导致了底层传输协议 `usrsctp` 做出“网络发生严重拥塞”的判断，从而引发了我们观察到的速度骤降且难以恢复的现象。问题的根源并非真正的网络拥塞，而是应用层的处理能力与网络数据到达速率之间的“缓冲带”不足。
 
 ## 4. 为什么调大 `RECV_QUEUE_LIMIT` 可以恢复速度
 
